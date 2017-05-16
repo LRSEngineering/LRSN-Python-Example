@@ -33,12 +33,27 @@ import sys
 import xml.etree.ElementTree as ET
 import errno
 import os
+import logging
+import sys
+import time
+from threading import Event, Thread
+log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
 
-def read(sock):
+formatter = logging.Formatter('%(asctime)s %(levelname)s - %(message)s')
+fh = logging.FileHandler('lrsn.log')
+# ch = logging.StreamHandler()
+# ch.setLevel(logging.DEBUG)
+# ch.setFormatter(formatter)
+fh.setFormatter(formatter)
+# log.addHandler(ch)
+log.addHandler(fh)
+
+def read(sock, quit_event=None):
     """Reads through data in buffer and stops when
     there is no more data or a new line is received."""
     buf = ''
-    while True:
+    while quit_event is None or not quit_event.isSet():
         try:
             chunk = sock.recv(1024)
             buf += chunk
@@ -48,7 +63,7 @@ def read(sock):
                 return buf[:-1]
         except socket.error as e:
             if e.errno != errno.EWOULDBLOCK and e.errno != errno.EAGAIN:
-                print("Error reading from socket: {}".format(os.strerror(e.errno)))
+                log.error("Error reading from socket: {}".format(os.strerror(e.errno)))
                 return None
 
 # Create a socket for transmitter connection
@@ -61,14 +76,16 @@ sock.connect((sys.argv[1], 3700))
 # At this point, we should get an intro message from the transmitter.
 # On the transmitter's LCD, you should see the client count increase
 # from 0 to 1.
-print("Got: {}".format(read(sock)))
+log.info("Got: {}".format(read(sock)))
 
 # The payload should look like this:
 # <LRSN services="NetPage:2.0;Config:1.0;Heartbeat:1.0;Inputs:1.0;PocsagRX:1.0;LrsRX:1.0;TableMan:1.0" device="T7470" swver="8.3.0.13" serno="20384" login="none" />
 # It's now going to wait for a Login message. Here, you will want to
 # define which services you are interested in. For majority use, NetPage
 # and Heartbeat is what you'll want. NetPage provides paging access and
-# Heartbeat provides pinging to help determine connection loss.
+# Heartbeat provides pinging to help determine connection loss. When the transmitter
+# sends a heartbeat and the underlying TCP Ack is not received, then it will
+# reset the connection.
 sock.sendall('<Login services="NetPage;Heartbeat" />\n')
 
 # ! Don't forget to append a newline at the end. If you use a XML library
@@ -78,16 +95,15 @@ sock.sendall('<Login services="NetPage;Heartbeat" />\n')
 # If everything works out, a LoginAck XML node will be sent with a attribute "ret".
 out = read(sock)
 
-print("Got: {}".format(out))
+log.info("Got: {}".format(out))
 
 # We'll parse the XML node to check to return code.
 root = ET.fromstring(out)
 
 logged_in = False
-
 if root.tag == "LoginAck":
-    # Get return code from attribute "ret". It will be a string, so the code should
-    # be converted into an integer.
+    # Get return code from attribute "ret". It will be a num berstring,
+    # so the code should be converted into an integer.
     return_code = int(root.attrib["ret"])
 
     # For all return codes, see
@@ -97,15 +113,100 @@ if root.tag == "LoginAck":
     if return_code == 0:
         # We have logged in.
         logged_in = True
+    else:
+        # Anything else, we'll print out
+        log.info("Unable to log in. Received: {}".format(return_code))
 
+# Quit event to set when to close socket and end thread and user input loops.
+t_quit = Event()
 
 # Set connection to non-blocking
 sock.setblocking(0)
 
-# We'll now enter a loop to expect heartbeats and status
-# message to our paging requests.
-while logged_in:
-    pass
+first_heartbeat_recieved = False
+last_heartbeat = -1
+next_heartbeat = -1
+heartbeat_interval = -1
+
+def lrsn_listener(sock):
+    # We'll now enter a loop to expect heartbeats and status
+    # message to our paging requests.
+    while logged_in and not t_quit.isSet():
+        # Read and parse incoming XML
+        out = read(sock, t_quit)
+        
+        if t_quit.isSet():
+            break;
+        
+        root = ET.fromstring(out)
+        log.info("Got: {}".format(out))
+        
+        if root.tag == "Heartbeat":
+            # Keep track of heartbeats
+            heartbeat_interval = int(root.attrib["interval"])
+            last_heartbeat = time.time()
+            next_heartbeat = last_heartbeat + heartbeat_interval
+            first_heartbeat_recieved = True
+        else:
+            # Check heartbeat time window
+            if first_heartbeat_recieved and next_heartbeat - last_heartbeat > heartbeat_interval:
+                # Did not receive a heartbeat since the last time within
+                # the interval. Break out, close, and reconnect.
+                log.info("Did not receive LRSN Heartbeat within {} since {}. Closing.".format(heartbeat_interval, last_heartbeat))
+                break
+            
+        # Idle
+        time.sleep(0.1)
+    
+
+# Start listener thread
+listener = Thread(target=lrsn_listener, args=(sock,))
+listener.start()
+
+page_request_id = 1
+
+# Start input loop
+while not t_quit.isSet():
+    number = raw_input("\nType a page number or type quit: ")
+    
+    if number == "":
+        continue
+    elif number == "quit":
+        t_quit.set()
+        break
+    
+    
+    try:
+        number = int(number)
+    except ValueError:
+        print("Invalid number. Try again.")
+        
+    pager_type = raw_input("\nEnter pager type by number (e.g. 0=>AlphaPager): ")
+    
+    try:
+        pager_type = int(pager_type)
+    except ValueError:
+        print("Invalid pager type. Try again.")
+    
+    if pager_type == 0:
+        # AlphaPager
+        message = raw_input("\nType a message: ")
+        
+        # Don't forget the newline at then end.
+        sock.sendall('<PageRequest id="{}" pager="{};{}" message="{}" />\n'.format(page_request_id, pager_type, number, message))
+    else:
+        # Don't forget the newline at then end.
+        sock.sendall('<PageRequest id="{}" pager="{};{}" message="Vibe1" />\n'.format(page_request_id, pager_type, number))
+    
+    # Increment page request id.
+    page_request_id += 1
+
+# Stop listener thread
+listener.join()
 
 # Close connection
-sock.close()
+try:
+    sock.close()
+except:
+    # Socket could be invalid.
+    pass
